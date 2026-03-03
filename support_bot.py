@@ -260,6 +260,20 @@ def _as_bool(value: str, *, default: bool = False) -> bool:
     return default
 
 
+def _normalize_transfer_target(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return ""
+    if raw.startswith("+"):
+        return raw
+    digits_only = re.sub(r"\D+", "", raw)
+    if len(digits_only) == 10:
+        return f"+1{digits_only}"
+    if len(digits_only) == 11 and digits_only.startswith("1"):
+        return f"+{digits_only}"
+    return raw
+
+
 class LiveTransferService:
     def __init__(self) -> None:
         self.mode = os.getenv("LIVE_TRANSFER_MODE", "sip").strip().lower()
@@ -290,7 +304,9 @@ class LiveTransferService:
                 message="Live transfer is disabled in configuration.",
             )
 
-        target = transfer_target.strip() or self.default_target
+        target = _normalize_transfer_target(transfer_target) or _normalize_transfer_target(
+            self.default_target
+        )
         if self.mode == "webhook":
             return await self._transfer_via_webhook(
                 room_name=room_name,

@@ -66,6 +66,7 @@ Live transfer to a human agent:
   - `LIVE_TRANSFER_MODE=sip`
   - `LIVE_TRANSFER_SIP_TRUNK_ID=<your outbound trunk id>`
   - `LIVE_TRANSFER_TARGET_NUMBER=<human agent phone number>`
+  - 10-digit US numbers are auto-normalized to E.164 (for example `7863891976` -> `+17863891976`).
 - Optional webhook mode:
   - `LIVE_TRANSFER_MODE=webhook`
   - `LIVE_TRANSFER_WEBHOOK_URL=<your transfer orchestration endpoint>`
