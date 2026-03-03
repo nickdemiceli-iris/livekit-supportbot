@@ -117,6 +117,7 @@ class KnowledgeBase:
         self._doc_freq: dict[str, int] = {}
         self._avg_doc_len = 0.0
         self._source_counts: dict[str, int] = {}
+        self._tool_cache: dict[tuple[str, int], str] = {}
 
     @property
     def chunk_count(self) -> int:
@@ -131,6 +132,7 @@ class KnowledgeBase:
         self._inverted_index.clear()
         self._doc_freq.clear()
         self._source_counts.clear()
+        self._tool_cache.clear()
 
         next_chunk_id = 0
         total_tokens = 0
@@ -181,7 +183,12 @@ class KnowledgeBase:
             return []
 
         unique_query_tokens = set(query_tokens)
-        min_terms_required = 1 if len(unique_query_tokens) <= 3 else 2
+        if len(unique_query_tokens) <= 2:
+            min_terms_required = len(unique_query_tokens)
+        elif len(unique_query_tokens) <= 4:
+            min_terms_required = 2
+        else:
+            min_terms_required = 3
         candidate_ids: set[int] = set()
         for token in unique_query_tokens:
             candidate_ids.update(self._inverted_index.get(token, set()))
@@ -232,15 +239,17 @@ class KnowledgeBase:
         *,
         top_k: int = 3,
         max_sentences: int = 3,
-    ) -> tuple[str, list[SearchResult]]:
+    ) -> tuple[str, list[SearchResult], bool]:
         results = self.search(question, top_k=max(1, top_k))
         if not results:
             return (
                 "I could not find a confident match in the knowledge base for that question.",
                 [],
+                False,
             )
 
-        query_tokens = set(_tokenize(question))
+        raw_query_tokens = set(_tokenize(question))
+        query_tokens = {token for token in raw_query_tokens if token not in _STOP_WORDS} or raw_query_tokens
         if query_tokens:
             query_tokens = {token for token in query_tokens if token not in _STOP_WORDS} or query_tokens
         candidate_sentences: list[tuple[float, str]] = []
@@ -283,16 +292,33 @@ class KnowledgeBase:
             if len(citations) >= 2:
                 break
         citation_suffix = f" [source: {', '.join(citations)}]" if citations else ""
-        return answer_text + citation_suffix, results
+        confidence_high = self._is_high_confidence(question, results)
+        return answer_text + citation_suffix, results, confidence_high
 
     def render_tool_payload(self, question: str, *, top_k: int = 3) -> str:
-        answer_text, results = self.answer(question, top_k=top_k)
+        cache_key = (_normalize_whitespace(question).lower(), max(1, top_k))
+        cached = self._tool_cache.get(cache_key)
+        if cached:
+            return cached
+
+        answer_text, results, confidence_high = self.answer(question, top_k=top_k)
         if not results:
-            return (
+            payload = (
                 "NO_MATCH\n"
                 "No relevant answer was found in the local knowledge base. "
                 "Ask a clarifying question or offer escalation."
             )
+            self._tool_cache[cache_key] = payload
+            return payload
+
+        if not confidence_high:
+            payload = (
+                "LOW_CONFIDENCE\n"
+                "Potentially related information exists, but there is not enough confidence to provide "
+                "a factual answer. Ask a concise clarifying question or offer escalation."
+            )
+            self._tool_cache[cache_key] = payload
+            return payload
 
         query_tokens = set(_tokenize(question))
         lines = [f"ANSWER\n{answer_text}", "EVIDENCE"]
@@ -305,7 +331,9 @@ class KnowledgeBase:
             lines.append(
                 f"[{index}] source={result.chunk.source} score={result.score:.3f} text={excerpt}"
             )
-        return "\n".join(lines)
+        payload = "\n".join(lines)
+        self._tool_cache[cache_key] = payload
+        return payload
 
     def inventory_summary(self, *, max_sources: int = 20) -> str:
         if not self._source_counts:
@@ -316,6 +344,26 @@ class KnowledgeBase:
         if len(self._source_counts) > max_sources:
             parts.append(f"- ...and {len(self._source_counts) - max_sources} more sources")
         return "\n".join(parts)
+
+    def _is_high_confidence(
+        self,
+        question: str,
+        results: list[SearchResult],
+    ) -> bool:
+        if not results:
+            return False
+        raw_query_tokens = set(_tokenize(question))
+        query_tokens = {token for token in raw_query_tokens if token not in _STOP_WORDS} or raw_query_tokens
+        if not query_tokens:
+            return False
+
+        top_chunk = results[0].chunk
+        top_score = results[0].score
+        coverage = len(query_tokens & set(top_chunk.token_freq.keys())) / len(query_tokens)
+
+        required_coverage = 1.0 if len(query_tokens) <= 2 else 0.6
+        required_score = 1.6
+        return coverage >= required_coverage and top_score >= required_score
 
     def _iter_source_files(self) -> list[Path]:
         if not self.knowledge_dir.exists():

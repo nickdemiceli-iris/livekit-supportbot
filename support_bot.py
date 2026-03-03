@@ -279,7 +279,7 @@ class SupportAgent(Agent):
         self,
         context: RunContext,
         question: str,
-        top_k: int = 2,
+        top_k: int = 1,
     ) -> str:
         """Search the internal knowledge base and return the most relevant evidence-backed answer."""
         safe_top_k = max(1, min(top_k, 5))
