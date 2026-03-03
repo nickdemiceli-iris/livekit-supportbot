@@ -7,7 +7,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib import request
 
 from dotenv import load_dotenv
@@ -35,6 +35,15 @@ SUPPORT_CONFIG: dict[str, str] = {
 
 
 @dataclass
+class LiveTransferOutcome:
+    success: bool
+    message: str
+    method: str
+    target: str | None = None
+    participant_identity: str | None = None
+
+
+@dataclass
 class SupportDispositionState:
     customer_identified: bool = False
     customer_name: str | None = None
@@ -46,6 +55,15 @@ class SupportDispositionState:
     resolution_summary: str | None = None
     escalation_needed: bool = False
     escalation_reason: str | None = None
+    live_transfer_requested: bool = False
+    live_transfer_started: bool = False
+    live_transfer_connected: bool = False
+    live_transfer_method: str | None = None
+    live_transfer_target: str | None = None
+    live_transfer_participant_identity: str | None = None
+    live_transfer_reason: str | None = None
+    live_transfer_error: str | None = None
+    handoff_summary: str | None = None
     follow_up_needed: bool = False
     follow_up_datetime: str | None = None
     preferred_contact_channel: str | None = None
@@ -155,6 +173,7 @@ def _infer_disposition_from_transcript(
         ]
         if any(marker in user_text_blob for marker in escalation_markers):
             disposition.escalation_needed = True
+            disposition.live_transfer_requested = True
             if not disposition.escalation_reason:
                 disposition.escalation_reason = "Customer requested human escalation."
 
@@ -187,6 +206,11 @@ def _build_post_call_report(
             "follow_up_datetime": disposition.follow_up_datetime,
             "escalation_needed": disposition.escalation_needed,
             "escalation_reason": disposition.escalation_reason,
+            "live_transfer_requested": disposition.live_transfer_requested,
+            "live_transfer_connected": disposition.live_transfer_connected,
+            "live_transfer_method": disposition.live_transfer_method,
+            "live_transfer_target": disposition.live_transfer_target,
+            "live_transfer_error": disposition.live_transfer_error,
             "troubleshooting_step_count": len(disposition.troubleshooting_steps),
         },
         "disposition": asdict(disposition),
@@ -223,6 +247,198 @@ def _post_report_to_webhook(report: dict[str, Any]) -> tuple[bool, str]:
             return True, f"Webhook post succeeded with status {resp.status}."
     except Exception as exc:  # pragma: no cover
         return False, f"Webhook post failed: {exc}"
+
+
+def _as_bool(value: str, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+class LiveTransferService:
+    def __init__(self) -> None:
+        self.mode = os.getenv("LIVE_TRANSFER_MODE", "sip").strip().lower()
+        self.default_target = os.getenv("LIVE_TRANSFER_TARGET_NUMBER", "").strip()
+        self.sip_trunk_id = os.getenv("LIVE_TRANSFER_SIP_TRUNK_ID", "").strip()
+        self.participant_name = (
+            os.getenv("LIVE_TRANSFER_PARTICIPANT_NAME", "Human Support Specialist").strip()
+            or "Human Support Specialist"
+        )
+        self.wait_until_answered = _as_bool(
+            os.getenv("LIVE_TRANSFER_WAIT_UNTIL_ANSWERED", "true"),
+            default=True,
+        )
+        self.transfer_webhook_url = os.getenv("LIVE_TRANSFER_WEBHOOK_URL", "").strip()
+
+    async def transfer(
+        self,
+        *,
+        room_name: str,
+        reason: str,
+        handoff_summary: str,
+        transfer_target: str = "",
+    ) -> LiveTransferOutcome:
+        if self.mode == "disabled":
+            return LiveTransferOutcome(
+                success=False,
+                method="disabled",
+                message="Live transfer is disabled in configuration.",
+            )
+
+        target = transfer_target.strip() or self.default_target
+        if self.mode == "webhook":
+            return await self._transfer_via_webhook(
+                room_name=room_name,
+                reason=reason,
+                handoff_summary=handoff_summary,
+                target=target,
+            )
+
+        return await self._transfer_via_sip(
+            room_name=room_name,
+            reason=reason,
+            handoff_summary=handoff_summary,
+            target=target,
+        )
+
+    async def _transfer_via_sip(
+        self,
+        *,
+        room_name: str,
+        reason: str,
+        handoff_summary: str,
+        target: str,
+    ) -> LiveTransferOutcome:
+        if not target:
+            return LiveTransferOutcome(
+                success=False,
+                method="sip",
+                message=(
+                    "No transfer target is configured. Set LIVE_TRANSFER_TARGET_NUMBER "
+                    "or pass transfer_target in the tool call."
+                ),
+            )
+        if not self.sip_trunk_id:
+            return LiveTransferOutcome(
+                success=False,
+                method="sip",
+                message="LIVE_TRANSFER_SIP_TRUNK_ID is not configured.",
+            )
+
+        try:
+            from livekit import api as lkapi
+            from livekit.protocol.sip import CreateSIPParticipantRequest
+        except Exception as exc:
+            return LiveTransferOutcome(
+                success=False,
+                method="sip",
+                message=f"LiveKit SIP SDK is unavailable: {exc}",
+            )
+
+        participant_identity = (
+            f"human-transfer-{datetime.now(tz=timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        )
+        req = CreateSIPParticipantRequest(
+            sip_trunk_id=self.sip_trunk_id,
+            sip_call_to=target,
+            room_name=room_name,
+            participant_identity=participant_identity,
+            participant_name=self.participant_name,
+            wait_until_answered=self.wait_until_answered,
+        )
+
+        livekit_api = lkapi.LiveKitAPI()
+        try:
+            await livekit_api.sip.create_sip_participant(req)
+        except Exception as exc:
+            return LiveTransferOutcome(
+                success=False,
+                method="sip",
+                target=target,
+                message=f"SIP transfer failed: {exc}",
+            )
+        finally:
+            close_coro = getattr(livekit_api, "aclose", None)
+            if callable(close_coro):
+                try:
+                    await close_coro()
+                except Exception:
+                    pass
+
+        summary_note = handoff_summary.strip()
+        if summary_note:
+            message = (
+                "Connected to human agent. "
+                f"Handoff summary prepared: {summary_note[:220]}"
+            )
+        else:
+            message = "Connected to human agent."
+        return LiveTransferOutcome(
+            success=True,
+            method="sip",
+            target=target,
+            participant_identity=participant_identity,
+            message=message,
+        )
+
+    async def _transfer_via_webhook(
+        self,
+        *,
+        room_name: str,
+        reason: str,
+        handoff_summary: str,
+        target: str,
+    ) -> LiveTransferOutcome:
+        if not self.transfer_webhook_url:
+            return LiveTransferOutcome(
+                success=False,
+                method="webhook",
+                target=target or None,
+                message="LIVE_TRANSFER_WEBHOOK_URL is not configured.",
+            )
+
+        payload = {
+            "timestamp_utc": datetime.now(tz=timezone.utc).isoformat(),
+            "room_name": room_name,
+            "target": target or None,
+            "reason": reason.strip(),
+            "handoff_summary": handoff_summary.strip(),
+            "company_name": SUPPORT_CONFIG["company_name"],
+        }
+        encoded = json.dumps(payload).encode("utf-8")
+        req = request.Request(
+            self.transfer_webhook_url,
+            data=encoded,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=10) as resp:
+                if 200 <= int(resp.status) < 300:
+                    return LiveTransferOutcome(
+                        success=True,
+                        method="webhook",
+                        target=target or None,
+                        message=f"Transfer webhook accepted with status {resp.status}.",
+                    )
+                return LiveTransferOutcome(
+                    success=False,
+                    method="webhook",
+                    target=target or None,
+                    message=f"Transfer webhook returned status {resp.status}.",
+                )
+        except Exception as exc:
+            return LiveTransferOutcome(
+                success=False,
+                method="webhook",
+                target=target or None,
+                message=f"Transfer webhook failed: {exc}",
+            )
 
 
 def _finalize_post_call(
@@ -263,16 +479,25 @@ def _load_knowledge_base(knowledge_dir: str) -> KnowledgeBase:
     return kb
 
 
+LiveTransferHandler = Callable[
+    [str, str, str],
+    Awaitable[LiveTransferOutcome],
+]
+
+
 class SupportAgent(Agent):
     def __init__(
         self,
         instructions: str,
         disposition: SupportDispositionState,
         knowledge_base: KnowledgeBase,
+        live_transfer_handler: LiveTransferHandler,
     ) -> None:
         super().__init__(instructions=instructions)
         self._disposition = disposition
         self._knowledge_base = knowledge_base
+        self._live_transfer_handler = live_transfer_handler
+        self._transfer_in_progress = False
 
     @function_tool
     async def lookup_knowledge_base(
@@ -362,6 +587,61 @@ class SupportAgent(Agent):
         return "Escalation recorded."
 
     @function_tool
+    async def request_live_transfer(
+        self,
+        context: RunContext,
+        reason: str,
+        handoff_summary: str = "",
+        transfer_target: str = "",
+    ) -> str:
+        """Connect the caller to a human support agent in real time."""
+        clean_reason = reason.strip() or "Customer requested a live human transfer."
+        clean_handoff_summary = handoff_summary.strip()
+        clean_target = transfer_target.strip()
+
+        self._disposition.escalation_needed = True
+        self._disposition.escalation_reason = clean_reason
+        self._disposition.live_transfer_requested = True
+        self._disposition.live_transfer_reason = clean_reason
+        if clean_handoff_summary:
+            self._disposition.handoff_summary = clean_handoff_summary
+
+        if self._disposition.live_transfer_connected:
+            return (
+                "TRANSFER_ALREADY_CONNECTED: A live human agent is already connected to the call."
+            )
+        if self._transfer_in_progress:
+            return "TRANSFER_IN_PROGRESS: Live transfer is already in progress."
+
+        self._transfer_in_progress = True
+        self._disposition.live_transfer_started = True
+        try:
+            outcome = await self._live_transfer_handler(
+                clean_reason,
+                clean_handoff_summary,
+                clean_target,
+            )
+        finally:
+            self._transfer_in_progress = False
+
+        self._disposition.live_transfer_method = outcome.method
+        if outcome.target:
+            self._disposition.live_transfer_target = outcome.target
+        if outcome.participant_identity:
+            self._disposition.live_transfer_participant_identity = (
+                outcome.participant_identity
+            )
+
+        if outcome.success:
+            self._disposition.live_transfer_connected = True
+            self._disposition.live_transfer_error = None
+            return f"TRANSFER_CONNECTED: {outcome.message}"
+
+        self._disposition.live_transfer_connected = False
+        self._disposition.live_transfer_error = outcome.message
+        return f"TRANSFER_FAILED: {outcome.message}"
+
+    @function_tool
     async def schedule_follow_up(
         self,
         context: RunContext,
@@ -387,7 +667,10 @@ class SupportAgent(Agent):
             self._disposition.notes = clean_note
 
 
-def build_agent() -> tuple[SupportAgent, SupportDispositionState, KnowledgeBase]:
+def build_agent(
+    *,
+    live_transfer_handler: LiveTransferHandler,
+) -> tuple[SupportAgent, SupportDispositionState, KnowledgeBase]:
     company_name = SUPPORT_CONFIG["company_name"]
     agent_name = SUPPORT_CONFIG["agent_name"]
     kb_dir = os.path.abspath(os.getenv("KNOWLEDGE_BASE_DIR", "knowledge_base"))
@@ -404,6 +687,7 @@ def build_agent() -> tuple[SupportAgent, SupportDispositionState, KnowledgeBase]
             instructions=prompt,
             disposition=disposition,
             knowledge_base=kb,
+            live_transfer_handler=live_transfer_handler,
         ),
         disposition,
         kb,
@@ -411,7 +695,24 @@ def build_agent() -> tuple[SupportAgent, SupportDispositionState, KnowledgeBase]
 
 
 async def entrypoint(ctx: JobContext) -> None:
-    agent, disposition, kb = build_agent()
+    transfer_service = LiveTransferService()
+
+    async def _handle_live_transfer(
+        reason: str,
+        handoff_summary: str,
+        transfer_target: str,
+    ) -> LiveTransferOutcome:
+        room_name = str(getattr(ctx.room, "name", "unknown"))
+        return await transfer_service.transfer(
+            room_name=room_name,
+            reason=reason,
+            handoff_summary=handoff_summary,
+            transfer_target=transfer_target,
+        )
+
+    agent, disposition, kb = build_agent(
+        live_transfer_handler=_handle_live_transfer,
+    )
     await ctx.connect()
     call_started_at = datetime.now(tz=timezone.utc)
     transcript: list[TranscriptTurn] = []
@@ -471,6 +772,11 @@ async def entrypoint(ctx: JobContext) -> None:
     print(
         "Knowledge base loaded: "
         f"{kb.source_count} sources, {kb.chunk_count} chunks.",
+        flush=True,
+    )
+    print(
+        "Live transfer mode: "
+        f"{transfer_service.mode or 'sip'}",
         flush=True,
     )
 

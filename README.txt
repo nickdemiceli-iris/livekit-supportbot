@@ -58,6 +58,18 @@ How the bot answers quickly:
 - `lookup_knowledge_base` returns an evidence-backed answer plus excerpts.
 - The assistant is instructed to call KB lookup before factual responses, reducing hallucinations.
 
+Live transfer to a human agent:
+
+- The bot supports real-time handoff with the `request_live_transfer` tool.
+- Default mode is SIP dial-out into the same LiveKit room.
+- Configure:
+  - `LIVE_TRANSFER_MODE=sip`
+  - `LIVE_TRANSFER_SIP_TRUNK_ID=<your outbound trunk id>`
+  - `LIVE_TRANSFER_TARGET_NUMBER=<human agent phone number>`
+- Optional webhook mode:
+  - `LIVE_TRANSFER_MODE=webhook`
+  - `LIVE_TRANSFER_WEBHOOK_URL=<your transfer orchestration endpoint>`
+
 Post-call output:
 
 - JSON reports are saved to `post_call_reports/` by default.
