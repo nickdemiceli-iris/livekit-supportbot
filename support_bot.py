@@ -108,7 +108,40 @@ def _is_user_role(role: str) -> bool:
     return role in {"user", "human", "customer"}
 
 
+def _is_live_transfer_request(text: str) -> bool:
+    normalized = text.strip().lower()
+    if not normalized:
+        return False
+
+    strong_phrases = [
+        "live representative",
+        "live rep",
+        "human representative",
+        "human agent",
+        "real person",
+        "talk to a person",
+        "speak to a person",
+        "speak to someone",
+        "transfer me",
+        "supervisor",
+    ]
+    if any(phrase in normalized for phrase in strong_phrases):
+        return True
+
+    intent_verbs = {"talk", "speak", "transfer", "connect"}
+    target_terms = {"human", "agent", "representative", "rep", "person"}
+    tokens = set(re.findall(r"[a-z0-9']+", normalized))
+    if tokens & intent_verbs and tokens & target_terms:
+        return True
+
+    if "right now" in normalized and ("agent" in tokens or "representative" in tokens):
+        return True
+    return False
+
+
 def _derive_outcome(disposition: SupportDispositionState) -> str:
+    if disposition.live_transfer_connected:
+        return "live_transfer_connected"
     if disposition.resolved is True:
         return "resolved"
     if disposition.escalation_needed:
@@ -119,6 +152,8 @@ def _derive_outcome(disposition: SupportDispositionState) -> str:
 
 
 def _derive_follow_up_needed(disposition: SupportDispositionState) -> bool:
+    if disposition.live_transfer_connected:
+        return False
     if disposition.follow_up_needed:
         return True
     if disposition.escalation_needed:
@@ -163,19 +198,13 @@ def _infer_disposition_from_transcript(
         elif any(marker in user_text_blob for marker in unresolved_markers):
             disposition.resolved = False
 
-    if not disposition.escalation_needed:
-        escalation_markers = [
-            "talk to a person",
-            "human agent",
-            "supervisor",
-            "escalate",
-            "transfer me",
-        ]
-        if any(marker in user_text_blob for marker in escalation_markers):
-            disposition.escalation_needed = True
-            disposition.live_transfer_requested = True
-            if not disposition.escalation_reason:
-                disposition.escalation_reason = "Customer requested human escalation."
+    if not disposition.escalation_needed and any(
+        _is_live_transfer_request(turn.text) for turn in user_turns
+    ):
+        disposition.escalation_needed = True
+        disposition.live_transfer_requested = True
+        if not disposition.escalation_reason:
+            disposition.escalation_reason = "Customer requested human escalation."
 
 
 def _build_post_call_report(
@@ -733,6 +762,7 @@ async def entrypoint(ctx: JobContext) -> None:
     call_started_at = datetime.now(tz=timezone.utc)
     transcript: list[TranscriptTurn] = []
     finalized = False
+    auto_transfer_task: asyncio.Task[None] | None = None
 
     session = AgentSession(
         stt=assemblyai.STT(
@@ -746,28 +776,102 @@ async def entrypoint(ctx: JobContext) -> None:
         vad=silero.VAD.load(),
     )
 
+    async def _run_auto_live_transfer(user_text: str) -> None:
+        if disposition.live_transfer_connected or disposition.live_transfer_started:
+            return
+
+        reason = "Customer explicitly requested live representative."
+        disposition.live_transfer_requested = True
+        disposition.live_transfer_started = True
+        disposition.live_transfer_reason = reason
+        disposition.escalation_needed = True
+        disposition.escalation_reason = reason
+        if not disposition.issue_summary:
+            disposition.issue_summary = user_text.strip()[:280]
+
+        try:
+            await session.generate_reply(
+                instructions=(
+                    "The customer asked for a live representative right now. "
+                    "Respond with exactly this line and nothing else: "
+                    "\"Absolutely - I will connect you to a live representative now. "
+                    "Please stay on the line while I transfer you.\""
+                )
+            )
+        except Exception as exc:
+            print(f"Auto-transfer pre-ack reply failed: {exc}", flush=True)
+
+        room_name = str(getattr(ctx.room, "name", "unknown"))
+        handoff_summary = disposition.issue_summary or user_text.strip()
+        outcome = await transfer_service.transfer(
+            room_name=room_name,
+            reason=reason,
+            handoff_summary=handoff_summary,
+            transfer_target="",
+        )
+
+        disposition.live_transfer_method = outcome.method
+        if outcome.target:
+            disposition.live_transfer_target = outcome.target
+        if outcome.participant_identity:
+            disposition.live_transfer_participant_identity = outcome.participant_identity
+
+        if outcome.success:
+            disposition.live_transfer_connected = True
+            disposition.live_transfer_error = None
+            try:
+                await session.generate_reply(
+                    instructions=(
+                        "A human representative is now connected. "
+                        "Respond with exactly this line and nothing else: "
+                        "\"You are now connected to a live representative.\""
+                    )
+                )
+            except Exception as exc:
+                print(f"Auto-transfer connected reply failed: {exc}", flush=True)
+            return
+
+        disposition.live_transfer_connected = False
+        disposition.live_transfer_error = outcome.message
+        try:
+            await session.generate_reply(
+                instructions=(
+                    "The transfer failed. Respond in one short sentence apologizing "
+                    "and offering to schedule an immediate callback."
+                )
+            )
+        except Exception as exc:
+            print(f"Auto-transfer failure reply failed: {exc}", flush=True)
+
     @session.on("conversation_item_added")
     def _on_conversation_item_added(event: Any) -> None:
+        nonlocal auto_transfer_task
         item = getattr(event, "item", None)
         if item is None:
             return
         text = _extract_item_text(item)
         if not text:
             return
+        role = _to_role_string(getattr(item, "role", "unknown"))
         transcript.append(
             TranscriptTurn(
                 timestamp_utc=datetime.now(tz=timezone.utc).isoformat(),
-                role=_to_role_string(getattr(item, "role", "unknown")),
+                role=role,
                 text=text,
                 interrupted=bool(getattr(item, "interrupted", False)),
             )
         )
+        if _is_user_role(role) and _is_live_transfer_request(text):
+            if auto_transfer_task is None or auto_transfer_task.done():
+                auto_transfer_task = asyncio.create_task(_run_auto_live_transfer(text))
 
     def _finalize_once(trigger: str) -> None:
         nonlocal finalized
         if finalized:
             return
         finalized = True
+        if auto_transfer_task and not auto_transfer_task.done():
+            auto_transfer_task.cancel()
         room_name = str(getattr(ctx.room, "name", "unknown"))
         try:
             _finalize_post_call(
