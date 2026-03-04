@@ -58,6 +58,7 @@ How the bot answers quickly:
 - `lookup_knowledge_base` returns an evidence-backed answer plus excerpts.
 - The assistant calls KB lookup only when factual precision is needed, reducing latency and hallucinations.
 - Low-latency defaults are enabled for English voice calls (`ASSEMBLYAI_STT_MODEL=universal-streaming`, `AGENT_TURN_DETECTION=stt`).
+- A response watchdog forces fast acknowledgment if the model is slow to answer.
 
 Production resiliency:
 
@@ -68,6 +69,14 @@ Production resiliency:
   - `STT_FALLBACK_ATTEMPT_TIMEOUT_SEC=8.0`
   - `OPENAI_TTS_FALLBACK_ENABLED=true`
   - `TTS_FALLBACK_ATTEMPT_TIMEOUT_SEC=8.0`
+  - `RESPONSE_WATCHDOG_ACK_SEC=1.8`
+  - `RESPONSE_WATCHDOG_FORCE_SEC=4.2`
+  - `RESPONSE_WATCHDOG_RETRY_SEC=2.4`
+
+Company baseline:
+
+- Set `SUPPORT_COMPANY_DESCRIPTION` in `.env`.
+- The agent can answer "who are you / what is <company>" immediately from this baseline without waiting on KB tools.
 
 Live transfer to a human agent:
 

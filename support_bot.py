@@ -42,6 +42,10 @@ load_dotenv()
 SUPPORT_CONFIG: dict[str, str] = {
     "company_name": os.getenv("SUPPORT_COMPANY_NAME", "Simple Loans"),
     "agent_name": os.getenv("SUPPORT_AGENT_NAME", "Abby"),
+    "company_description": os.getenv(
+        "SUPPORT_COMPANY_DESCRIPTION",
+        "Simple Loans provides title loan options and helps customers understand eligibility, terms, and next steps.",
+    ),
 }
 
 
@@ -148,6 +152,35 @@ def _is_live_transfer_request(text: str) -> bool:
     if "right now" in normalized and ("agent" in tokens or "representative" in tokens):
         return True
     return False
+
+
+def _is_company_identity_question(text: str, company_name: str) -> bool:
+    normalized = text.strip().lower()
+    if not normalized:
+        return False
+    direct_patterns = [
+        "what is",
+        "who is",
+        "tell me about",
+        "what does",
+    ]
+    if not any(pattern in normalized for pattern in direct_patterns):
+        return False
+    name = company_name.strip().lower()
+    if not name:
+        return False
+    short_name = name.replace("loans", "").strip()
+    return name in normalized or (short_name and short_name in normalized)
+
+
+def _is_substantive_user_turn(text: str) -> bool:
+    normalized = text.strip().lower()
+    if not normalized:
+        return False
+    if normalized in {"uh", "um", "hmm", "mm"}:
+        return True
+    tokens = re.findall(r"[a-z0-9']+", normalized)
+    return len(tokens) >= 1
 
 
 def _derive_outcome(disposition: SupportDispositionState) -> str:
@@ -1003,6 +1036,7 @@ def build_agent(
         company_name=company_name,
         agent_name=agent_name,
         knowledge_base_summary=kb.inventory_summary(),
+        company_description=SUPPORT_CONFIG["company_description"],
     )
     disposition = SupportDispositionState()
     return (
@@ -1041,6 +1075,27 @@ async def entrypoint(ctx: JobContext) -> None:
     transcript: list[TranscriptTurn] = []
     finalized = False
     auto_transfer_task: asyncio.Task[None] | None = None
+    response_watchdog_task: asyncio.Task[None] | None = None
+    pending_user_turn_id = 0
+    resolved_user_turn_id = 0
+    acknowledged_user_turn_id = 0
+    pending_user_text = ""
+    pending_user_turn_at_monotonic = 0.0
+    watchdog_busy = False
+    watchdog_last_force_at = 0.0
+
+    watchdog_ack_after_sec = _as_float(
+        os.getenv("RESPONSE_WATCHDOG_ACK_SEC", "1.8"),
+        default=1.8,
+    )
+    watchdog_force_after_sec = _as_float(
+        os.getenv("RESPONSE_WATCHDOG_FORCE_SEC", "4.2"),
+        default=4.2,
+    )
+    watchdog_retry_sec = _as_float(
+        os.getenv("RESPONSE_WATCHDOG_RETRY_SEC", "2.4"),
+        default=2.4,
+    )
 
     vad = silero.VAD.load()
     stt_engine = _build_stt(vad=vad)
@@ -1052,6 +1107,82 @@ async def entrypoint(ctx: JobContext) -> None:
         tts=tts_engine,
         vad=vad,
     )
+
+    loop = asyncio.get_running_loop()
+
+    def _mark_user_pending(text: str) -> None:
+        nonlocal pending_user_turn_id, pending_user_text, pending_user_turn_at_monotonic
+        pending_user_turn_id += 1
+        pending_user_text = text.strip()
+        pending_user_turn_at_monotonic = loop.time()
+
+    def _mark_assistant_responded() -> None:
+        nonlocal resolved_user_turn_id
+        if pending_user_turn_id > resolved_user_turn_id:
+            resolved_user_turn_id = pending_user_turn_id
+
+    async def _response_watchdog() -> None:
+        nonlocal acknowledged_user_turn_id, watchdog_busy, watchdog_last_force_at, pending_user_turn_at_monotonic
+        company_name = SUPPORT_CONFIG["company_name"]
+        company_description = SUPPORT_CONFIG["company_description"]
+        while True:
+            await asyncio.sleep(0.25)
+            if finalized:
+                return
+            if pending_user_turn_id <= resolved_user_turn_id:
+                continue
+            if watchdog_busy:
+                continue
+
+            age_sec = loop.time() - pending_user_turn_at_monotonic
+            latest_text = pending_user_text
+            latest_turn_id = pending_user_turn_id
+
+            if (
+                age_sec >= watchdog_ack_after_sec
+                and acknowledged_user_turn_id < latest_turn_id
+            ):
+                watchdog_busy = True
+                try:
+                    if _is_company_identity_question(latest_text, company_name):
+                        await session.generate_reply(
+                            instructions=(
+                                "The customer asked what the company is. "
+                                f"Reply immediately in one short sentence using this exact profile: {company_description} "
+                                "Then ask one short next-step sales question."
+                            )
+                        )
+                    else:
+                        await session.generate_reply(
+                            instructions=(
+                                "The customer is waiting. Reply immediately in one short sentence, "
+                                "acknowledge their latest point, and ask one focused sales-forward question."
+                            )
+                        )
+                    acknowledged_user_turn_id = latest_turn_id
+                except Exception as exc:
+                    print(f"Response watchdog acknowledge failed: {exc}", flush=True)
+                finally:
+                    watchdog_busy = False
+                continue
+
+            can_force = (loop.time() - watchdog_last_force_at) >= watchdog_retry_sec
+            if age_sec >= watchdog_force_after_sec and can_force:
+                watchdog_busy = True
+                try:
+                    await session.generate_reply(
+                        instructions=(
+                            "The customer has been waiting too long. "
+                            f"Respond now to this exact user message: \"{latest_text}\". "
+                            "Keep it to one concise sentence and include a clear next-step question."
+                        )
+                    )
+                    watchdog_last_force_at = loop.time()
+                    pending_user_turn_at_monotonic = loop.time()
+                except Exception as exc:
+                    print(f"Response watchdog force-reply failed: {exc}", flush=True)
+                finally:
+                    watchdog_busy = False
 
     async def _run_auto_live_transfer(user_text: str) -> None:
         if disposition.live_transfer_connected or disposition.live_transfer_started:
@@ -1138,6 +1269,10 @@ async def entrypoint(ctx: JobContext) -> None:
                 interrupted=bool(getattr(item, "interrupted", False)),
             )
         )
+        if _is_user_role(role) and _is_substantive_user_turn(text):
+            _mark_user_pending(text)
+        elif role == "assistant":
+            _mark_assistant_responded()
         if _is_user_role(role) and _is_live_transfer_request(text):
             if auto_transfer_task is None or auto_transfer_task.done():
                 auto_transfer_task = asyncio.create_task(_run_auto_live_transfer(text))
@@ -1149,6 +1284,8 @@ async def entrypoint(ctx: JobContext) -> None:
         finalized = True
         if auto_transfer_task and not auto_transfer_task.done():
             auto_transfer_task.cancel()
+        if response_watchdog_task and not response_watchdog_task.done():
+            response_watchdog_task.cancel()
         room_name = str(getattr(ctx.room, "name", "unknown"))
         try:
             _finalize_post_call(
@@ -1183,10 +1320,18 @@ async def entrypoint(ctx: JobContext) -> None:
         f"tts={tts_engine.__class__.__name__}",
         flush=True,
     )
+    print(
+        "Response watchdog: "
+        f"ack={watchdog_ack_after_sec:.1f}s "
+        f"force={watchdog_force_after_sec:.1f}s "
+        f"retry={watchdog_retry_sec:.1f}s",
+        flush=True,
+    )
 
     company_name = SUPPORT_CONFIG["company_name"]
     agent_name = SUPPORT_CONFIG["agent_name"]
     await session.start(room=ctx.room, agent=agent)
+    response_watchdog_task = asyncio.create_task(_response_watchdog())
     await session.generate_reply(
         instructions=(
             "Start the call with this exact line: "
