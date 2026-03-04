@@ -20,13 +20,21 @@ from livekit.agents import (
     WorkerOptions,
     cli,
     function_tool,
-    stt as lk_stt,
-    tts as lk_tts,
 )
 from livekit.plugins import assemblyai, cartesia, openai, silero
 
 from knowledge_base import KnowledgeBase
 from prompting import build_system_prompt
+
+try:
+    from livekit.agents import stt as lk_stt
+except Exception:  # pragma: no cover - compatibility fallback
+    lk_stt = None
+
+try:
+    from livekit.agents import tts as lk_tts
+except Exception:  # pragma: no cover - compatibility fallback
+    lk_tts = None
 
 load_dotenv()
 
@@ -590,7 +598,7 @@ def _build_stt(*, vad: Any) -> Any:
             print(f"STT fallback disabled; using single provider. {' | '.join(errors)}", flush=True)
         return providers[0]
 
-    fallback_cls = getattr(lk_stt, "FallbackAdapter", None)
+    fallback_cls = getattr(lk_stt, "FallbackAdapter", None) if lk_stt is not None else None
     if fallback_cls is None:
         print(
             "STT FallbackAdapter is unavailable in this LiveKit version; using primary STT only.",
@@ -687,7 +695,7 @@ def _build_tts() -> Any:
             print(f"TTS fallback disabled; using single provider. {' | '.join(errors)}", flush=True)
         return providers[0]
 
-    fallback_cls = getattr(lk_tts, "FallbackAdapter", None)
+    fallback_cls = getattr(lk_tts, "FallbackAdapter", None) if lk_tts is not None else None
     if fallback_cls is None:
         print(
             "TTS FallbackAdapter is unavailable in this LiveKit version; using primary TTS only.",
