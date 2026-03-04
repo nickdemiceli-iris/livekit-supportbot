@@ -59,6 +59,16 @@ How the bot answers quickly:
 - The assistant calls KB lookup only when factual precision is needed, reducing latency and hallucinations.
 - Low-latency defaults are enabled for English voice calls (`ASSEMBLYAI_STT_MODEL=universal-streaming`, `AGENT_TURN_DETECTION=stt`).
 
+Production resiliency:
+
+- STT runs with automatic failover (AssemblyAI primary -> OpenAI fallback) when available.
+- TTS runs with automatic failover (Cartesia primary -> OpenAI fallback) when available.
+- Configure fallback behavior in `.env`:
+  - `OPENAI_STT_FALLBACK_ENABLED=true`
+  - `STT_FALLBACK_ATTEMPT_TIMEOUT_SEC=8.0`
+  - `OPENAI_TTS_FALLBACK_ENABLED=true`
+  - `TTS_FALLBACK_ATTEMPT_TIMEOUT_SEC=8.0`
+
 Live transfer to a human agent:
 
 - The bot supports real-time handoff with the `request_live_transfer` tool.

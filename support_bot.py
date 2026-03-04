@@ -20,6 +20,8 @@ from livekit.agents import (
     WorkerOptions,
     cli,
     function_tool,
+    stt as lk_stt,
+    tts as lk_tts,
 )
 from livekit.plugins import assemblyai, cartesia, openai, silero
 
@@ -315,6 +317,10 @@ def _callable_params(fn: Any) -> set[str]:
         return set()
 
 
+def _has_env_key(key: str) -> bool:
+    return bool(os.getenv(key, "").strip())
+
+
 def _normalize_transfer_target(value: str) -> str:
     raw = value.strip()
     if not raw:
@@ -512,7 +518,7 @@ class LiveTransferService:
             )
 
 
-def _build_stt() -> Any:
+def _build_assemblyai_stt() -> Any:
     stt_params = _callable_params(assemblyai.STT)
     kwargs: dict[str, Any] = {
         "model": os.getenv("ASSEMBLYAI_STT_MODEL", "universal-streaming"),
@@ -540,7 +546,95 @@ def _build_stt() -> Any:
     return assemblyai.STT(**kwargs)
 
 
-def _build_tts() -> Any:
+def _build_openai_stt() -> Any:
+    stt_params = _callable_params(openai.STT)
+    kwargs: dict[str, Any] = {}
+    if "model" in stt_params:
+        kwargs["model"] = os.getenv("OPENAI_STT_MODEL", "gpt-4o-transcribe")
+    if "language" in stt_params:
+        kwargs["language"] = os.getenv("OPENAI_STT_LANGUAGE", "en")
+    return openai.STT(**kwargs)
+
+
+def _build_stt(*, vad: Any) -> Any:
+    providers: list[Any] = []
+    errors: list[str] = []
+
+    if _as_bool(os.getenv("ASSEMBLYAI_STT_ENABLED", "true"), default=True):
+        if _has_env_key("ASSEMBLYAI_API_KEY"):
+            try:
+                providers.append(_build_assemblyai_stt())
+            except Exception as exc:
+                errors.append(f"AssemblyAI STT init failed: {exc}")
+        else:
+            errors.append("AssemblyAI STT enabled but ASSEMBLYAI_API_KEY is missing.")
+
+    openai_fallback_enabled = _as_bool(
+        os.getenv("OPENAI_STT_FALLBACK_ENABLED", "true"),
+        default=True,
+    )
+    if openai_fallback_enabled:
+        if _has_env_key("OPENAI_API_KEY"):
+            try:
+                providers.append(_build_openai_stt())
+            except Exception as exc:
+                errors.append(f"OpenAI STT fallback init failed: {exc}")
+        else:
+            errors.append("OpenAI STT fallback enabled but OPENAI_API_KEY is missing.")
+
+    if not providers:
+        details = " | ".join(errors) if errors else "No STT providers configured."
+        raise RuntimeError(f"Unable to initialize any STT provider. {details}")
+    if len(providers) == 1:
+        if errors:
+            print(f"STT fallback disabled; using single provider. {' | '.join(errors)}", flush=True)
+        return providers[0]
+
+    fallback_cls = getattr(lk_stt, "FallbackAdapter", None)
+    if fallback_cls is None:
+        print(
+            "STT FallbackAdapter is unavailable in this LiveKit version; using primary STT only.",
+            flush=True,
+        )
+        return providers[0]
+
+    attempt_timeout = _as_float(
+        os.getenv("STT_FALLBACK_ATTEMPT_TIMEOUT_SEC", "8.0"),
+        default=8.0,
+    )
+    max_retry_per_stt = _as_int(
+        os.getenv("STT_FALLBACK_MAX_RETRY_PER_PROVIDER", "1"),
+        default=1,
+    )
+    retry_interval = _as_float(
+        os.getenv("STT_FALLBACK_RETRY_INTERVAL_SEC", "0.6"),
+        default=0.6,
+    )
+
+    kwargs: dict[str, Any] = {
+        "stt": providers,
+        "attempt_timeout": attempt_timeout,
+        "max_retry_per_stt": max_retry_per_stt,
+        "retry_interval": retry_interval,
+    }
+    if "vad" in _callable_params(fallback_cls):
+        kwargs["vad"] = vad
+
+    try:
+        fallback = fallback_cls(**kwargs)
+    except TypeError:
+        kwargs.pop("vad", None)
+        try:
+            fallback = fallback_cls(**kwargs)
+        except TypeError:
+            fallback = fallback_cls(providers)
+
+    if errors:
+        print(f"STT providers initialized with warnings: {' | '.join(errors)}", flush=True)
+    return fallback
+
+
+def _build_cartesia_tts() -> Any:
     tts_params = _callable_params(cartesia.TTS)
     kwargs: dict[str, Any] = {
         "model": os.getenv("CARTESIA_TTS_MODEL", "sonic-3"),
@@ -549,6 +643,85 @@ def _build_tts() -> Any:
     if "speed" in tts_params:
         kwargs["speed"] = _as_float(os.getenv("CARTESIA_TTS_SPEED", "1.06"), default=1.06)
     return cartesia.TTS(**kwargs)
+
+
+def _build_openai_tts() -> Any:
+    tts_params = _callable_params(openai.TTS)
+    kwargs: dict[str, Any] = {}
+    if "model" in tts_params:
+        kwargs["model"] = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+    if "voice" in tts_params:
+        kwargs["voice"] = os.getenv("OPENAI_TTS_VOICE", "alloy")
+    if "speed" in tts_params:
+        kwargs["speed"] = _as_float(os.getenv("OPENAI_TTS_SPEED", "1.0"), default=1.0)
+    return openai.TTS(**kwargs)
+
+
+def _build_tts() -> Any:
+    providers: list[Any] = []
+    errors: list[str] = []
+
+    if _as_bool(os.getenv("CARTESIA_TTS_ENABLED", "true"), default=True):
+        if _has_env_key("CARTESIA_API_KEY"):
+            try:
+                providers.append(_build_cartesia_tts())
+            except Exception as exc:
+                errors.append(f"Cartesia TTS init failed: {exc}")
+        else:
+            errors.append("Cartesia TTS enabled but CARTESIA_API_KEY is missing.")
+
+    if _as_bool(os.getenv("OPENAI_TTS_FALLBACK_ENABLED", "true"), default=True):
+        if _has_env_key("OPENAI_API_KEY"):
+            try:
+                providers.append(_build_openai_tts())
+            except Exception as exc:
+                errors.append(f"OpenAI TTS fallback init failed: {exc}")
+        else:
+            errors.append("OpenAI TTS fallback enabled but OPENAI_API_KEY is missing.")
+
+    if not providers:
+        details = " | ".join(errors) if errors else "No TTS providers configured."
+        raise RuntimeError(f"Unable to initialize any TTS provider. {details}")
+    if len(providers) == 1:
+        if errors:
+            print(f"TTS fallback disabled; using single provider. {' | '.join(errors)}", flush=True)
+        return providers[0]
+
+    fallback_cls = getattr(lk_tts, "FallbackAdapter", None)
+    if fallback_cls is None:
+        print(
+            "TTS FallbackAdapter is unavailable in this LiveKit version; using primary TTS only.",
+            flush=True,
+        )
+        return providers[0]
+
+    attempt_timeout = _as_float(
+        os.getenv("TTS_FALLBACK_ATTEMPT_TIMEOUT_SEC", "8.0"),
+        default=8.0,
+    )
+    max_retry_per_tts = _as_int(
+        os.getenv("TTS_FALLBACK_MAX_RETRY_PER_PROVIDER", "1"),
+        default=1,
+    )
+    retry_interval = _as_float(
+        os.getenv("TTS_FALLBACK_RETRY_INTERVAL_SEC", "0.6"),
+        default=0.6,
+    )
+
+    kwargs: dict[str, Any] = {
+        "tts": providers,
+        "attempt_timeout": attempt_timeout,
+        "max_retry_per_tts": max_retry_per_tts,
+        "retry_interval": retry_interval,
+    }
+    try:
+        fallback = fallback_cls(**kwargs)
+    except TypeError:
+        fallback = fallback_cls(providers)
+
+    if errors:
+        print(f"TTS providers initialized with warnings: {' | '.join(errors)}", flush=True)
+    return fallback
 
 
 def _build_llm() -> Any:
@@ -861,11 +1034,15 @@ async def entrypoint(ctx: JobContext) -> None:
     finalized = False
     auto_transfer_task: asyncio.Task[None] | None = None
 
+    vad = silero.VAD.load()
+    stt_engine = _build_stt(vad=vad)
+    llm_engine = _build_llm()
+    tts_engine = _build_tts()
     session = _build_agent_session(
-        stt=_build_stt(),
-        llm=_build_llm(),
-        tts=_build_tts(),
-        vad=silero.VAD.load(),
+        stt=stt_engine,
+        llm=llm_engine,
+        tts=tts_engine,
+        vad=vad,
     )
 
     async def _run_auto_live_transfer(user_text: str) -> None:
@@ -989,6 +1166,13 @@ async def entrypoint(ctx: JobContext) -> None:
     print(
         "Live transfer mode: "
         f"{transfer_service.mode or 'sip'}",
+        flush=True,
+    )
+    print(
+        "Voice stack: "
+        f"stt={stt_engine.__class__.__name__}, "
+        f"llm={llm_engine.__class__.__name__}, "
+        f"tts={tts_engine.__class__.__name__}",
         flush=True,
     )
 
