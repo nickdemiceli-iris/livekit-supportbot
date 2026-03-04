@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -289,6 +290,31 @@ def _as_bool(value: str, *, default: bool = False) -> bool:
     return default
 
 
+def _as_int(value: str | None, *, default: int) -> int:
+    if value is None or not str(value).strip():
+        return default
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        return default
+
+
+def _as_float(value: str | None, *, default: float) -> float:
+    if value is None or not str(value).strip():
+        return default
+    try:
+        return float(str(value).strip())
+    except ValueError:
+        return default
+
+
+def _callable_params(fn: Any) -> set[str]:
+    try:
+        return set(inspect.signature(fn).parameters.keys())
+    except Exception:
+        return set()
+
+
 def _normalize_transfer_target(value: str) -> str:
     raw = value.strip()
     if not raw:
@@ -484,6 +510,77 @@ class LiveTransferService:
                 target=target or None,
                 message=f"Transfer webhook failed: {exc}",
             )
+
+
+def _build_stt() -> Any:
+    stt_params = _callable_params(assemblyai.STT)
+    kwargs: dict[str, Any] = {
+        "model": os.getenv("ASSEMBLYAI_STT_MODEL", "universal-streaming"),
+    }
+
+    stt_language = os.getenv("ASSEMBLYAI_STT_LANGUAGE", "en").strip()
+    if "language" in stt_params and stt_language:
+        kwargs["language"] = stt_language
+
+    if "end_of_turn_confidence_threshold" in stt_params:
+        kwargs["end_of_turn_confidence_threshold"] = _as_float(
+            os.getenv("ASSEMBLYAI_END_OF_TURN_CONFIDENCE_THRESHOLD", "0.34"),
+            default=0.34,
+        )
+    if "min_end_of_turn_silence_when_confident" in stt_params:
+        kwargs["min_end_of_turn_silence_when_confident"] = _as_int(
+            os.getenv("ASSEMBLYAI_MIN_EOT_SILENCE_MS", "160"),
+            default=160,
+        )
+    if "max_turn_silence" in stt_params:
+        kwargs["max_turn_silence"] = _as_int(
+            os.getenv("ASSEMBLYAI_MAX_TURN_SILENCE_MS", "720"),
+            default=720,
+        )
+    return assemblyai.STT(**kwargs)
+
+
+def _build_tts() -> Any:
+    tts_params = _callable_params(cartesia.TTS)
+    kwargs: dict[str, Any] = {
+        "model": os.getenv("CARTESIA_TTS_MODEL", "sonic-3"),
+        "language": os.getenv("TTS_LANGUAGE", "en"),
+    }
+    if "speed" in tts_params:
+        kwargs["speed"] = _as_float(os.getenv("CARTESIA_TTS_SPEED", "1.06"), default=1.06)
+    return cartesia.TTS(**kwargs)
+
+
+def _build_llm() -> Any:
+    return openai.LLM(model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"))
+
+
+def _build_agent_session(*, stt: Any, llm: Any, tts: Any, vad: Any) -> AgentSession:
+    kwargs: dict[str, Any] = {
+        "stt": stt,
+        "llm": llm,
+        "tts": tts,
+        "vad": vad,
+    }
+
+    session_params = _callable_params(AgentSession)
+    if "turn_detection" in session_params:
+        requested = os.getenv("AGENT_TURN_DETECTION", "stt").strip().lower()
+        if requested:
+            kwargs["turn_detection"] = requested
+
+    if "preemptive_synthesis" in session_params:
+        kwargs["preemptive_synthesis"] = _as_bool(
+            os.getenv("AGENT_PREEMPTIVE_SYNTHESIS", "true"),
+            default=True,
+        )
+
+    try:
+        return AgentSession(**kwargs)
+    except TypeError:
+        kwargs.pop("turn_detection", None)
+        kwargs.pop("preemptive_synthesis", None)
+        return AgentSession(**kwargs)
 
 
 def _finalize_post_call(
@@ -764,15 +861,10 @@ async def entrypoint(ctx: JobContext) -> None:
     finalized = False
     auto_transfer_task: asyncio.Task[None] | None = None
 
-    session = AgentSession(
-        stt=assemblyai.STT(
-            model=os.getenv("ASSEMBLYAI_STT_MODEL", "universal-streaming-multilingual")
-        ),
-        llm=openai.LLM(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini")),
-        tts=cartesia.TTS(
-            model=os.getenv("CARTESIA_TTS_MODEL", "sonic-3"),
-            language=os.getenv("TTS_LANGUAGE", "en"),
-        ),
+    session = _build_agent_session(
+        stt=_build_stt(),
+        llm=_build_llm(),
+        tts=_build_tts(),
         vad=silero.VAD.load(),
     )
 
@@ -905,9 +997,10 @@ async def entrypoint(ctx: JobContext) -> None:
     await session.start(room=ctx.room, agent=agent)
     await session.generate_reply(
         instructions=(
-            "Start the support call with this exact line: "
-            f"\"Hi, thank you for contacting {company_name} support. "
-            f"I'm {agent_name}. How can I help you today?\""
+            "Start the call with this exact line: "
+            f"\"Hi, this is {agent_name} with {company_name}. "
+            "I can help you get the right loan option quickly. "
+            "What are you looking to do today?\""
         )
     )
 

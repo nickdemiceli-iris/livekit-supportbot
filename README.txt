@@ -1,19 +1,19 @@
-LiveKit Support Bot with Fast Local Knowledge Base
+LiveKit Sales Agent with Fast Local Knowledge Base
 
-This repository contains a production-ready LiveKit voice support bot that:
+This repository contains a production-ready LiveKit voice sales agent that:
 
-- sounds natural and concise (modeled after your sales-bot structure),
+- sounds natural and consultative (expert sales style),
 - uses LiveKit `AgentSession` + tools,
-- answers support questions from a local knowledge base with low latency,
-- captures transcript and support disposition,
+- answers policy and pricing questions from a local knowledge base with low latency,
+- captures transcript and call disposition,
 - writes post-call reports to disk and optionally posts to a webhook.
 
 Files:
 
-- `support_bot.py` - main LiveKit support worker
+- `support_bot.py` - main LiveKit sales worker
 - `knowledge_base.py` - fast local KB indexing + retrieval
-- `prompting.py` - support-specific system prompt builder
-- `knowledge_base/` - add your support docs (`.md`, `.txt`, `.json`, `.yaml`, `.yml`)
+- `prompting.py` - sales-specific system prompt builder
+- `knowledge_base/` - add your sales/policy docs (`.md`, `.txt`, `.json`, `.yaml`, `.yml`)
 
 Quick start:
 
@@ -42,7 +42,7 @@ Set at minimum:
 
 3) Add your knowledge base files
 
-Place your support docs in `knowledge_base/`.
+Place your sales and policy docs in `knowledge_base/`.
 The bot indexes them at startup and serves answers through the `lookup_knowledge_base` tool.
 
 4) Run the worker
@@ -56,7 +56,8 @@ How the bot answers quickly:
 - The KB is loaded and indexed once at startup.
 - Retrieval uses an in-memory inverted index with BM25-style scoring.
 - `lookup_knowledge_base` returns an evidence-backed answer plus excerpts.
-- The assistant is instructed to call KB lookup before factual responses, reducing hallucinations.
+- The assistant calls KB lookup only when factual precision is needed, reducing latency and hallucinations.
+- Low-latency defaults are enabled for English voice calls (`ASSEMBLYAI_STT_MODEL=universal-streaming`, `AGENT_TURN_DETECTION=stt`).
 
 Live transfer to a human agent:
 
