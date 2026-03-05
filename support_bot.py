@@ -183,6 +183,26 @@ def _is_substantive_user_turn(text: str) -> bool:
     return len(tokens) >= 1
 
 
+def _is_simple_greeting(text: str) -> bool:
+    normalized = text.strip().lower()
+    if not normalized:
+        return False
+    stripped = re.sub(r"[^a-z0-9\s']", " ", normalized)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    greetings = {
+        "hi",
+        "hello",
+        "hey",
+        "yo",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "what's up",
+        "whats up",
+    }
+    return stripped in greetings
+
+
 def _derive_outcome(disposition: SupportDispositionState) -> str:
     if disposition.live_transfer_connected:
         return "live_transfer_connected"
@@ -1081,16 +1101,18 @@ async def entrypoint(ctx: JobContext) -> None:
     acknowledged_user_turn_id = 0
     pending_user_text = ""
     pending_user_turn_at_monotonic = 0.0
+    last_assistant_turn_at_monotonic = 0.0
+    assistant_turn_count = 0
     watchdog_busy = False
     watchdog_last_force_at = 0.0
 
     watchdog_ack_after_sec = _as_float(
-        os.getenv("RESPONSE_WATCHDOG_ACK_SEC", "1.8"),
-        default=1.8,
+        os.getenv("RESPONSE_WATCHDOG_ACK_SEC", "2.6"),
+        default=2.6,
     )
     watchdog_force_after_sec = _as_float(
-        os.getenv("RESPONSE_WATCHDOG_FORCE_SEC", "4.2"),
-        default=4.2,
+        os.getenv("RESPONSE_WATCHDOG_FORCE_SEC", "5.8"),
+        default=5.8,
     )
     watchdog_retry_sec = _as_float(
         os.getenv("RESPONSE_WATCHDOG_RETRY_SEC", "2.4"),
@@ -1117,9 +1139,11 @@ async def entrypoint(ctx: JobContext) -> None:
         pending_user_turn_at_monotonic = loop.time()
 
     def _mark_assistant_responded() -> None:
-        nonlocal resolved_user_turn_id
+        nonlocal resolved_user_turn_id, last_assistant_turn_at_monotonic, assistant_turn_count
         if pending_user_turn_id > resolved_user_turn_id:
             resolved_user_turn_id = pending_user_turn_id
+        last_assistant_turn_at_monotonic = loop.time()
+        assistant_turn_count += 1
 
     async def _response_watchdog() -> None:
         nonlocal acknowledged_user_turn_id, watchdog_busy, watchdog_last_force_at, pending_user_turn_at_monotonic
@@ -1137,6 +1161,15 @@ async def entrypoint(ctx: JobContext) -> None:
             age_sec = loop.time() - pending_user_turn_at_monotonic
             latest_text = pending_user_text
             latest_turn_id = pending_user_turn_id
+            since_last_assistant = loop.time() - last_assistant_turn_at_monotonic
+
+            # Avoid stepping on normal model flow immediately after a reply.
+            if assistant_turn_count > 0 and since_last_assistant < 1.6:
+                continue
+
+            # Simple greetings should be handled naturally by the model first.
+            if _is_simple_greeting(latest_text) and age_sec < (watchdog_force_after_sec + 1.2):
+                continue
 
             if (
                 age_sec >= watchdog_ack_after_sec
@@ -1155,8 +1188,8 @@ async def entrypoint(ctx: JobContext) -> None:
                     else:
                         await session.generate_reply(
                             instructions=(
-                                "The customer is waiting. Reply immediately in one short sentence, "
-                                "acknowledge their latest point, and ask one focused sales-forward question."
+                                "The customer is waiting. Reply naturally in one short sentence only. "
+                                "Acknowledge their latest point, do not re-introduce yourself, and do not repeat prior questions."
                             )
                         )
                     acknowledged_user_turn_id = latest_turn_id
@@ -1174,7 +1207,7 @@ async def entrypoint(ctx: JobContext) -> None:
                         instructions=(
                             "The customer has been waiting too long. "
                             f"Respond now to this exact user message: \"{latest_text}\". "
-                            "Keep it to one concise sentence and include a clear next-step question."
+                            "Keep it concise, natural, and avoid repeating your introduction."
                         )
                     )
                     watchdog_last_force_at = loop.time()
@@ -1336,8 +1369,7 @@ async def entrypoint(ctx: JobContext) -> None:
         instructions=(
             "Start the call with this exact line: "
             f"\"Hi, this is {agent_name} with {company_name}. "
-            "I can help you get the right loan option quickly. "
-            "What are you looking to do today?\""
+            "How can I help with your loan today?\""
         )
     )
 
