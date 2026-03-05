@@ -1170,6 +1170,9 @@ async def entrypoint(ctx: JobContext) -> None:
             # Simple greetings should be handled naturally by the model first.
             if _is_simple_greeting(latest_text) and age_sec < (watchdog_force_after_sec + 1.2):
                 continue
+            # Extra protection against double-intro right after the initial opening.
+            if _is_simple_greeting(latest_text) and assistant_turn_count <= 1 and age_sec < 7.5:
+                continue
 
             if (
                 age_sec >= watchdog_ack_after_sec
@@ -1186,12 +1189,20 @@ async def entrypoint(ctx: JobContext) -> None:
                             )
                         )
                     else:
-                        await session.generate_reply(
-                            instructions=(
-                                "The customer is waiting. Reply naturally in one short sentence only. "
-                                "Acknowledge their latest point, do not re-introduce yourself, and do not repeat prior questions."
+                        if _is_simple_greeting(latest_text):
+                            await session.generate_reply(
+                                instructions=(
+                                    "Customer sent a simple greeting. Reply with one short friendly line only. "
+                                    "Do not introduce yourself again and do not repeat the opening question."
+                                )
                             )
-                        )
+                        else:
+                            await session.generate_reply(
+                                instructions=(
+                                    "The customer is waiting. Reply naturally in one short sentence only. "
+                                    "Acknowledge their latest point, do not re-introduce yourself, and do not repeat prior questions."
+                                )
+                            )
                     acknowledged_user_turn_id = latest_turn_id
                 except Exception as exc:
                     print(f"Response watchdog acknowledge failed: {exc}", flush=True)
@@ -1368,8 +1379,7 @@ async def entrypoint(ctx: JobContext) -> None:
     await session.generate_reply(
         instructions=(
             "Start the call with this exact line: "
-            f"\"Hi, this is {agent_name} with {company_name}. "
-            "How can I help with your loan today?\""
+            f"\"Hi, this is {agent_name} with {company_name}.\""
         )
     )
 

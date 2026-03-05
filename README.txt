@@ -59,6 +59,7 @@ How the bot answers quickly:
 - The assistant calls KB lookup only when factual precision is needed, reducing latency and hallucinations.
 - Low-latency defaults are enabled for English voice calls (`ASSEMBLYAI_STT_MODEL=universal-streaming`, `AGENT_TURN_DETECTION=stt`).
 - A response watchdog forces fast acknowledgment if the model is slow to answer.
+- Greeting handling avoids repeated self-introductions for natural flow.
 
 Production resiliency:
 
