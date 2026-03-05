@@ -183,6 +183,10 @@ def _is_substantive_user_turn(text: str) -> bool:
     return len(tokens) >= 1
 
 
+def _is_assistant_role(role: str) -> bool:
+    return role in {"assistant", "ai", "agent", "bot"}
+
+
 def _is_simple_greeting(text: str) -> bool:
     normalized = text.strip().lower()
     if not normalized:
@@ -1105,6 +1109,7 @@ async def entrypoint(ctx: JobContext) -> None:
     assistant_turn_count = 0
     watchdog_busy = False
     watchdog_last_force_at = 0.0
+    current_agent_state = "unknown"
 
     watchdog_ack_after_sec = _as_float(
         os.getenv("RESPONSE_WATCHDOG_ACK_SEC", "2.6"),
@@ -1158,6 +1163,10 @@ async def entrypoint(ctx: JobContext) -> None:
             if watchdog_busy:
                 continue
 
+            # If the agent is already processing or speaking, don't inject another reply.
+            if current_agent_state in {"thinking", "speaking"}:
+                continue
+
             age_sec = loop.time() - pending_user_turn_at_monotonic
             latest_text = pending_user_text
             latest_turn_id = pending_user_turn_id
@@ -1200,7 +1209,8 @@ async def entrypoint(ctx: JobContext) -> None:
                             await session.generate_reply(
                                 instructions=(
                                     "The customer is waiting. Reply naturally in one short sentence only. "
-                                    "Acknowledge their latest point, do not re-introduce yourself, and do not repeat prior questions."
+                                    "Acknowledge their latest point, answer directly when possible, "
+                                    "do not re-introduce yourself, and do not repeat prior questions."
                                 )
                             )
                     acknowledged_user_turn_id = latest_turn_id
@@ -1218,7 +1228,7 @@ async def entrypoint(ctx: JobContext) -> None:
                         instructions=(
                             "The customer has been waiting too long. "
                             f"Respond now to this exact user message: \"{latest_text}\". "
-                            "Keep it concise, natural, and avoid repeating your introduction."
+                            "Keep it concise, natural, answer directly, and avoid repeating your introduction."
                         )
                     )
                     watchdog_last_force_at = loop.time()
@@ -1315,11 +1325,17 @@ async def entrypoint(ctx: JobContext) -> None:
         )
         if _is_user_role(role) and _is_substantive_user_turn(text):
             _mark_user_pending(text)
-        elif role == "assistant":
+        elif _is_assistant_role(role):
             _mark_assistant_responded()
         if _is_user_role(role) and _is_live_transfer_request(text):
             if auto_transfer_task is None or auto_transfer_task.done():
                 auto_transfer_task = asyncio.create_task(_run_auto_live_transfer(text))
+
+    @session.on("agent_state_changed")
+    def _on_agent_state_changed(event: Any) -> None:
+        nonlocal current_agent_state
+        state = getattr(event, "state", None)
+        current_agent_state = str(getattr(state, "value", state) or "").strip().lower()
 
     def _finalize_once(trigger: str) -> None:
         nonlocal finalized
