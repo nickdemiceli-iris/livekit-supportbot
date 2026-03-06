@@ -30,6 +30,7 @@ Setup:
 3) Copy `.env.example` to `.env` and fill your keys.
 4) Run in dev mode:
    `python3 support_agent.py dev`
+   (The app auto-loads `.env` via `python-dotenv`.)
 
 Customizing your knowledge base:
 - Edit `knowledge_base/knowledge_base.json` (or add more `*.json` files in `KNOWLEDGE_BASE_DIR`) and add entries in this shape:
@@ -45,3 +46,4 @@ Notes:
 - Add synonyms in `keywords` to improve match quality.
 - `SUPPORT_COMPANY_NAME`, `SUPPORT_AGENT_NAME`, and `SUPPORT_COMPANY_DESCRIPTION` are used in the assistant's system instructions.
 - `SUPPORT_OPENING_GREETING` can override the opening script if needed.
+- If startup fails with missing config, verify `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` are set in `.env`.

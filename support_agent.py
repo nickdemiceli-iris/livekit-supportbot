@@ -4,6 +4,12 @@ import os
 from pathlib import Path
 from typing import Any
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - fallback for environments without python-dotenv
+    def load_dotenv() -> bool:
+        return False
+
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -20,6 +26,8 @@ from livekit.plugins import assemblyai, cartesia, openai
 from knowledge_base import FALLBACK_MESSAGE, KnowledgeBase
 
 DEFAULT_OPENING_GREETING = "Hello, thank you for calling so simple customer support how can i help you today."
+
+load_dotenv()
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -144,6 +152,29 @@ Conversation flow rules:
 """
 
 
+def _validate_runtime_env() -> None:
+    missing: list[str] = []
+
+    required_always = ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET", "OPENAI_API_KEY")
+    for name in required_always:
+        if not os.getenv(name):
+            missing.append(name)
+
+    if _env_bool("ASSEMBLYAI_STT_ENABLED", True) and not os.getenv("ASSEMBLYAI_API_KEY"):
+        missing.append("ASSEMBLYAI_API_KEY")
+
+    if _env_bool("CARTESIA_TTS_ENABLED", True) and not os.getenv("CARTESIA_API_KEY"):
+        missing.append("CARTESIA_API_KEY")
+
+    if missing:
+        unique_missing = sorted(set(missing))
+        raise RuntimeError(
+            "Missing required environment variables: "
+            + ", ".join(unique_missing)
+            + ". Ensure .env is present or export them before running the agent."
+        )
+
+
 class SupportVoiceAgent(Agent):
     def __init__(self, knowledge_base: KnowledgeBase) -> None:
         super().__init__(instructions=_build_instructions())
@@ -200,4 +231,5 @@ async def entrypoint(ctx: JobContext) -> None:
 
 
 if __name__ == "__main__":
+    _validate_runtime_env()
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
