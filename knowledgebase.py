@@ -1,4 +1,4 @@
-"""Knowledge base and policy snippets for the Simple Loans bot."""
+"""Knowledge base and policy snippets for the Simple Loans support agent."""
 
 from __future__ import annotations
 

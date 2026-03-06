@@ -1,4 +1,4 @@
-"""Natural, policy-grounded support bot for Simple Loans."""
+"""Natural, policy-grounded support agent for Simple Loans."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import random
 import re
 from typing import Optional
 
-from .knowledge import (
+from knowledgebase import (
     ESCALATION_KEYWORDS,
     FAQ_ANSWERS,
     LATE_AND_HARDSHIP_POLICY,
@@ -17,6 +17,15 @@ from .knowledge import (
     STATUS_IDENTIFIER_KEYWORDS,
     VDC_POLICY,
     VEHICLE_AND_TITLE_POLICY,
+)
+from prompting import (
+    ESCALATION_MESSAGE,
+    FOLLOWUP_CHANNEL_QUESTION,
+    FOLLOWUP_CONFIRM_TEMPLATE,
+    FOLLOWUP_TIME_QUESTION,
+    closing_message,
+    opening_disclosure,
+    resolution_question,
 )
 
 
@@ -54,8 +63,8 @@ class ConversationState:
     failed_payment_mentions: int = 0
 
 
-class SimpleLoansSupportBot:
-    """Stateful conversational bot that keeps responses natural and concise."""
+class SimpleLoansSupportAgent:
+    """Stateful conversational agent that keeps responses natural and concise."""
 
     def __init__(self, agent_name: str = "Mia", seed: int = 7) -> None:
         self.agent_name = agent_name
@@ -71,9 +80,7 @@ class SimpleLoansSupportBot:
 
         greeting = ""
         if not self.state.greeted:
-            greeting = (
-                f"Hi, I am {self.agent_name}, a virtual support assistant for Simple Loans. "
-            )
+            greeting = opening_disclosure(self.agent_name)
             self.state.greeted = True
 
         if self._requires_immediate_escalation(normalized):
@@ -83,10 +90,7 @@ class SimpleLoansSupportBot:
             self.state.preferred_channel = text
             self.state.awaiting_followup_channel = False
             self.state.awaiting_followup_time = True
-            return (
-                greeting
-                + "Thanks, I noted that. What time works best for a follow-up?"
-            )
+            return greeting + FOLLOWUP_TIME_QUESTION
 
         if self.state.awaiting_followup_time:
             self.state.preferred_time = text
@@ -94,11 +98,7 @@ class SimpleLoansSupportBot:
             self.state.awaiting_resolution_confirmation = False
             channel = self.state.preferred_channel or "your preferred channel"
             when = self.state.preferred_time or "your preferred time"
-            return (
-                greeting
-                + f"Perfect, I have noted a follow-up via {channel} around {when}. "
-                + "A human specialist will continue from here."
-            )
+            return greeting + FOLLOWUP_CONFIRM_TEMPLATE.format(channel=channel, when=when)
 
         if self.state.awaiting_status_identifier:
             if _looks_like_identifier(text):
@@ -124,11 +124,7 @@ class SimpleLoansSupportBot:
             if _is_no(normalized):
                 self.state.awaiting_resolution_confirmation = False
                 self.state.awaiting_followup_channel = True
-                return (
-                    greeting
-                    + "Understood. I can arrange a follow-up with a specialist. "
-                    + "Which contact channel do you prefer?"
-                )
+                return greeting + FOLLOWUP_CHANNEL_QUESTION
 
         intent = self._detect_intent(normalized)
         response = self._intent_response(intent)
@@ -139,17 +135,17 @@ class SimpleLoansSupportBot:
             return True
         if self.state.failed_payment_mentions >= 2:
             return True
-        if "policy exception" in normalized_message or "make an exception" in normalized_message:
+        if (
+            "policy exception" in normalized_message
+            or "make an exception" in normalized_message
+        ):
             return True
         return False
 
     def _escalation_message(self) -> str:
         self.state.awaiting_resolution_confirmation = False
         self.state.awaiting_status_identifier = False
-        return (
-            "Thank you for flagging this. I am escalating your case now to a human "
-            "specialist for priority handling."
-        )
+        return ESCALATION_MESSAGE
 
     def _detect_intent(self, normalized_message: str) -> str:
         message = normalized_message
@@ -177,15 +173,47 @@ class SimpleLoansSupportBot:
             )
         ):
             return "status"
-        if any(word in message for word in ("payment", "due date", "prepayment", "pay early", "partial payment", "bank holiday")):
+        if any(
+            word in message
+            for word in (
+                "payment",
+                "due date",
+                "prepayment",
+                "pay early",
+                "partial payment",
+                "bank holiday",
+            )
+        ):
             return "payments"
-        if any(word in message for word in ("late", "hardship", "struggling", "can't pay", "cannot pay")):
+        if any(
+            word in message
+            for word in ("late", "hardship", "struggling", "can't pay", "cannot pay")
+        ):
             return "late_hardship"
         if "vdc" in message or "debt cancellation" in message or "dca" in message:
             return "vdc"
-        if any(word in message for word in ("title", "vehicle inspection", "government id", "proof of address", "lienholder")):
+        if any(
+            word in message
+            for word in (
+                "title",
+                "vehicle inspection",
+                "government id",
+                "proof of address",
+                "lienholder",
+            )
+        ):
             return "vehicle_docs"
-        if any(word in message for word in ("apr", "fee", "terms", "doc stamp", "registration fee", "repayment schedule")):
+        if any(
+            word in message
+            for word in (
+                "apr",
+                "fee",
+                "terms",
+                "doc stamp",
+                "registration fee",
+                "repayment schedule",
+            )
+        ):
             return "terms"
 
         if "auto equity" in message or "title loan" in message or "car equity" in message:
@@ -216,9 +244,7 @@ class SimpleLoansSupportBot:
         if intent == "status":
             self.state.awaiting_status_identifier = True
             self.state.awaiting_resolution_confirmation = False
-            return (
-                "I can help with your loan status. Please share your account identifier."
-            )
+            return "I can help with your loan status. Please share your account identifier."
 
         if intent == "disbursement_timeline":
             return LOAN_STATUS_AND_DISBURSEMENT + " " + self._resolution_question()
@@ -248,20 +274,25 @@ class SimpleLoansSupportBot:
 
     def _resolution_question(self) -> str:
         self.state.awaiting_resolution_confirmation = True
-        options = [
-            "Did this answer your question?",
-            "Did that clear things up for you?",
-            "Does this resolve what you needed?",
-        ]
-        return self._rng.choice(options)
+        return resolution_question(self._rng)
 
     def _closing_message(self) -> str:
-        closings = [
-            "Great, happy to help. If anything else comes up, I am here.",
-            "Glad that helped. Reach out anytime if you need more support.",
-            "Perfect. If you need anything else, I can help.",
-        ]
-        return self._rng.choice(closings)
+        return closing_message(self._rng)
+
+
+def run_chat() -> None:
+    agent = SimpleLoansSupportAgent()
+    print("Simple Loans Support Chat")
+    print("Type 'exit' to quit.\n")
+    while True:
+        user_input = input("You: ").strip()
+        if user_input.lower() in {"exit", "quit"}:
+            print("Agent: Thanks for contacting Simple Loans support. Take care.")
+            break
+        if not user_input:
+            print("Agent: Please send a message when you are ready.")
+            continue
+        print(f"Agent: {agent.respond(user_input)}")
 
 
 def _normalize(value: str) -> str:
@@ -289,4 +320,12 @@ def _has_greeting(normalized_value: str) -> bool:
 
 def _looks_like_identifier(value: str) -> bool:
     compact = value.strip()
-    return bool(re.search(r"[a-zA-Z]", compact) and re.search(r"\d", compact) and len(compact) >= 5)
+    return bool(
+        re.search(r"[a-zA-Z]", compact)
+        and re.search(r"\d", compact)
+        and len(compact) >= 5
+    )
+
+
+if __name__ == "__main__":
+    run_chat()

@@ -1,7 +1,7 @@
-Simple Loans Natural Support Bot
+Simple Loans Natural Support Agent
 
-This project provides a natural, policy-grounded support bot for Simple Loans.
-The bot introduces itself as a virtual assistant in the opening message, then
+This project provides a natural, policy-grounded support agent for Simple Loans.
+The agent introduces itself as a virtual assistant in the opening message, then
 responds in a concise human-support style.
 
 Key behaviors implemented:
@@ -15,8 +15,13 @@ Key behaviors implemented:
 
 Run locally:
 
-1) Start chat
-   python3 app.py
+1) Start chat (entrypoint: agent.py)
+   python3 agent.py
 
 2) Run tests
    python3 -m unittest discover -s tests -p "test_*.py"
+
+Project structure:
+- agent.py: conversation engine + CLI entrypoint
+- prompting.py: natural phrasing templates
+- knowledgebase.py: policy and FAQ knowledge source
