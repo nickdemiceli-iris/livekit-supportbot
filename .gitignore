@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+data/unanswered_questions.jsonl
+knowledge_base/unanswered_questions.jsonl
+post_call_reports/

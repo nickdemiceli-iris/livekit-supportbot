@@ -1,0 +1,32 @@
+[
+  {
+    "id": "billing-001",
+    "question": "How do I update the credit card on my account?",
+    "keywords": ["billing", "payment method", "credit card", "update card", "account settings"],
+    "answer": "To update your credit card, sign in to your account, go to Billing, select Payment Method, and add your new card details. Save the change to make it your default payment method."
+  },
+  {
+    "id": "billing-002",
+    "question": "When are invoices available each month?",
+    "keywords": ["invoice", "billing cycle", "statement", "charges"],
+    "answer": "Invoices are generated on the first day of each month and remain available in your Billing section for download."
+  },
+  {
+    "id": "account-001",
+    "question": "How can I reset my password?",
+    "keywords": ["password reset", "forgot password", "sign in help"],
+    "answer": "Use the Forgot Password link on the sign-in page, enter your email, and follow the reset link sent to your inbox."
+  },
+  {
+    "id": "account-002",
+    "question": "How do I contact a human representative?",
+    "keywords": ["human", "agent", "representative", "escalation", "callback"],
+    "answer": "I can note your request and a representative can follow up with you. Please share the best contact email or phone number for the callback."
+  },
+  {
+    "id": "technical-001",
+    "question": "What should I do if audio quality is poor on a voice call?",
+    "keywords": ["audio", "call quality", "lag", "choppy", "network"],
+    "answer": "Please check your network connection, close high-bandwidth apps, and retry with a headset if available. If the issue continues, contact support with your call time and device details."
+  }
+]
