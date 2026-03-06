@@ -100,13 +100,59 @@ class KnowledgeBase:
         unanswered_log_path: Path | None = None,
     ) -> "KnowledgeBase":
         raw = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(raw, list):
-            raise ValueError("Knowledge base JSON must be a list of entries.")
+        entries = cls._parse_entries(raw, source=str(path))
+
+        return cls(
+            entries=entries,
+            fallback_message=fallback_message,
+            min_confidence=min_confidence,
+            unanswered_log_path=unanswered_log_path,
+        )
+
+    @classmethod
+    def from_directory(
+        cls,
+        directory: Path,
+        fallback_message: str = FALLBACK_MESSAGE,
+        min_confidence: float = 0.32,
+        unanswered_log_path: Path | None = None,
+    ) -> "KnowledgeBase":
+        if not directory.exists() or not directory.is_dir():
+            raise ValueError(f"Knowledge base directory not found: {directory}")
+
+        candidates = sorted(path for path in directory.glob("*.json") if path.name != "unanswered_questions.jsonl")
+        if not candidates:
+            raise ValueError(f"No JSON files found in knowledge base directory: {directory}")
+
+        combined_entries: list[KnowledgeBaseEntry] = []
+        for path in candidates:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            combined_entries.extend(cls._parse_entries(raw, source=str(path)))
+
+        if not combined_entries:
+            raise ValueError(f"No valid knowledge base entries found in: {directory}")
+
+        return cls(
+            entries=combined_entries,
+            fallback_message=fallback_message,
+            min_confidence=min_confidence,
+            unanswered_log_path=unanswered_log_path,
+        )
+
+    @staticmethod
+    def _parse_entries(raw: object, source: str) -> list[KnowledgeBaseEntry]:
+        if isinstance(raw, dict):
+            raw_entries = raw.get("entries")
+        else:
+            raw_entries = raw
+
+        if not isinstance(raw_entries, list):
+            raise ValueError(f"Knowledge base JSON must be a list (or object with entries[]) in {source}.")
 
         entries: list[KnowledgeBaseEntry] = []
-        for idx, item in enumerate(raw):
+        for idx, item in enumerate(raw_entries):
             if not isinstance(item, dict):
-                raise ValueError(f"Knowledge base entry at index {idx} must be an object.")
+                raise ValueError(f"Knowledge base entry at index {idx} in {source} must be an object.")
 
             entry_id = str(item.get("id", f"entry-{idx + 1}"))
             question = str(item.get("question", "")).strip()
@@ -114,7 +160,7 @@ class KnowledgeBase:
             keywords = [str(keyword).strip() for keyword in item.get("keywords", []) if str(keyword).strip()]
 
             if not question or not answer:
-                raise ValueError(f"Knowledge base entry '{entry_id}' must include question and answer.")
+                raise ValueError(f"Knowledge base entry '{entry_id}' in {source} must include question and answer.")
 
             entries.append(
                 KnowledgeBaseEntry(
@@ -125,12 +171,7 @@ class KnowledgeBase:
                 )
             )
 
-        return cls(
-            entries=entries,
-            fallback_message=fallback_message,
-            min_confidence=min_confidence,
-            unanswered_log_path=unanswered_log_path,
-        )
+        return entries
 
     def _score(self, query: str, entry: KnowledgeBaseEntry) -> float:
         query_tokens = _tokenize(query)
