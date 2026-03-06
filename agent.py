@@ -1,60 +1,59 @@
-"""Natural, policy-grounded support agent for Simple Loans."""
+"""LiveKit voice agent for Simple Loans support with strict KB grounding."""
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterable
 from dataclasses import dataclass
+import os
 import random
 import re
 from typing import Optional
 
+from dotenv import load_dotenv
+from livekit.agents import (
+    Agent,
+    AgentSession,
+    AutoSubscribe,
+    JobContext,
+    JobProcess,
+    ModelSettings,
+    WorkerOptions,
+    cli,
+    llm,
+)
+from livekit.plugins import cartesia, deepgram, silero
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
 from knowledgebase import (
     ESCALATION_KEYWORDS,
-    FAQ_ANSWERS,
-    LATE_AND_HARDSHIP_POLICY,
     LOAN_STATUS_AND_DISBURSEMENT,
-    LOAN_TERMS,
-    PAYMENT_POLICY,
     STATUS_IDENTIFIER_KEYWORDS,
-    VDC_POLICY,
-    VEHICLE_AND_TITLE_POLICY,
+    match_article,
+    normalize_text,
 )
 from prompting import (
     ESCALATION_MESSAGE,
     FOLLOWUP_CHANNEL_QUESTION,
     FOLLOWUP_CONFIRM_TEMPLATE,
     FOLLOWUP_TIME_QUESTION,
+    NO_FOLLOWUP_CLOSE,
+    OPENING_DISCLOSURE,
+    UNANSWERABLE_FALLBACK,
+    VOICE_SYSTEM_INSTRUCTIONS,
     closing_message,
-    opening_disclosure,
     resolution_question,
 )
 
 
-YES_PATTERNS = {
-    "yes",
-    "y",
-    "yep",
-    "yeah",
-    "correct",
-    "that helps",
-    "solved",
-    "resolved",
-}
-NO_PATTERNS = {
-    "no",
-    "n",
-    "nope",
-    "not really",
-    "didn't help",
-    "did not help",
-    "still need help",
-}
+YES_PATTERNS = {"yes", "y", "yep", "yeah", "correct", "that helps", "solved", "resolved"}
+NO_PATTERNS = {"no", "n", "nope", "not really", "didn't help", "did not help", "still need help"}
 
 
 @dataclass
 class ConversationState:
-    greeted: bool = False
     awaiting_status_identifier: bool = False
     awaiting_resolution_confirmation: bool = False
+    awaiting_followup_interest: bool = False
     awaiting_followup_channel: bool = False
     awaiting_followup_time: bool = False
     preferred_channel: Optional[str] = None
@@ -63,240 +62,185 @@ class ConversationState:
     failed_payment_mentions: int = 0
 
 
-class SimpleLoansSupportAgent:
-    """Stateful conversational agent that keeps responses natural and concise."""
+class SimpleLoansPolicyEngine:
+    """Deterministic policy engine to avoid hallucinations and enforce fallback."""
 
-    def __init__(self, agent_name: str = "Mia", seed: int = 7) -> None:
-        self.agent_name = agent_name
+    def __init__(self, seed: int = 7) -> None:
         self.state = ConversationState()
         self._rng = random.Random(seed)
 
-    def respond(self, user_message: str) -> str:
+    def answer(self, user_message: str) -> str:
         text = user_message.strip()
-        normalized = _normalize(text)
+        normalized = normalize_text(text)
 
         if "failed payment" in normalized or "payment failed" in normalized:
             self.state.failed_payment_mentions += 1
 
-        greeting = ""
-        if not self.state.greeted:
-            greeting = opening_disclosure(self.agent_name)
-            self.state.greeted = True
-
         if self._requires_immediate_escalation(normalized):
-            return greeting + self._escalation_message()
+            self._reset_pending_prompts()
+            return ESCALATION_MESSAGE
+
+        if self.state.awaiting_followup_interest:
+            self.state.awaiting_followup_interest = False
+            if _is_yes(normalized):
+                self.state.awaiting_followup_channel = True
+                return FOLLOWUP_CHANNEL_QUESTION
+            return NO_FOLLOWUP_CLOSE
 
         if self.state.awaiting_followup_channel:
             self.state.preferred_channel = text
             self.state.awaiting_followup_channel = False
             self.state.awaiting_followup_time = True
-            return greeting + FOLLOWUP_TIME_QUESTION
+            return FOLLOWUP_TIME_QUESTION
 
         if self.state.awaiting_followup_time:
             self.state.preferred_time = text
             self.state.awaiting_followup_time = False
-            self.state.awaiting_resolution_confirmation = False
             channel = self.state.preferred_channel or "your preferred channel"
             when = self.state.preferred_time or "your preferred time"
-            return greeting + FOLLOWUP_CONFIRM_TEMPLATE.format(channel=channel, when=when)
+            return FOLLOWUP_CONFIRM_TEMPLATE.format(channel=channel, when=when)
 
         if self.state.awaiting_status_identifier:
             if _looks_like_identifier(text):
                 self.state.account_identifier = text
                 self.state.awaiting_status_identifier = False
                 return (
-                    greeting
-                    + "Thank you. "
-                    + LOAN_STATUS_AND_DISBURSEMENT
-                    + " "
-                    + self._resolution_question()
+                    f"Thank you. {LOAN_STATUS_AND_DISBURSEMENT} "
+                    f"{self._resolution_question()}"
                 )
-            return (
-                greeting
-                + "I still need your account identifier to check status flow. "
-                + "Please share it when ready."
-            )
+            return "I still need your account identifier to check status. Please share it when ready."
 
         if self.state.awaiting_resolution_confirmation:
             if _is_yes(normalized):
                 self.state.awaiting_resolution_confirmation = False
-                return greeting + self._closing_message()
+                return closing_message(self._rng)
             if _is_no(normalized):
                 self.state.awaiting_resolution_confirmation = False
                 self.state.awaiting_followup_channel = True
-                return greeting + FOLLOWUP_CHANNEL_QUESTION
+                return FOLLOWUP_CHANNEL_QUESTION
 
-        intent = self._detect_intent(normalized)
-        response = self._intent_response(intent)
-        return greeting + response
+        if self._is_status_request(normalized):
+            self.state.awaiting_status_identifier = True
+            return "I can help with your loan status. Please share your account identifier."
+
+        matched_article = match_article(normalized)
+        if matched_article is None:
+            self.state.awaiting_followup_interest = True
+            return UNANSWERABLE_FALLBACK
+
+        answer_text = matched_article.answer
+        if matched_article.intent == "loan_status_and_disbursement":
+            self.state.awaiting_status_identifier = False
+
+        return f"{answer_text} {self._resolution_question()}"
 
     def _requires_immediate_escalation(self, normalized_message: str) -> bool:
         if any(keyword in normalized_message for keyword in ESCALATION_KEYWORDS):
             return True
         if self.state.failed_payment_mentions >= 2:
             return True
-        if (
-            "policy exception" in normalized_message
-            or "make an exception" in normalized_message
-        ):
+        if "policy exception" in normalized_message or "make an exception" in normalized_message:
             return True
         return False
 
-    def _escalation_message(self) -> str:
-        self.state.awaiting_resolution_confirmation = False
-        self.state.awaiting_status_identifier = False
-        return ESCALATION_MESSAGE
-
-    def _detect_intent(self, normalized_message: str) -> str:
-        message = normalized_message
-
-        if _has_greeting(message):
-            return "greeting"
-        if any(
-            word in message
-            for word in (
-                "same day funding",
-                "same-day funding",
-                "funds arrive",
-                "disbursement time",
-            )
-        ):
-            return "disbursement_timeline"
-        if any(
-            word in message
-            for word in (
-                "status",
-                "where is my loan",
-                "check my loan",
-                "my application",
-                "pending",
-            )
-        ):
-            return "status"
-        if any(
-            word in message
-            for word in (
-                "payment",
-                "due date",
-                "prepayment",
-                "pay early",
-                "partial payment",
-                "bank holiday",
-            )
-        ):
-            return "payments"
-        if any(
-            word in message
-            for word in ("late", "hardship", "struggling", "can't pay", "cannot pay")
-        ):
-            return "late_hardship"
-        if "vdc" in message or "debt cancellation" in message or "dca" in message:
-            return "vdc"
-        if any(
-            word in message
-            for word in (
-                "title",
-                "vehicle inspection",
-                "government id",
-                "proof of address",
-                "lienholder",
-            )
-        ):
-            return "vehicle_docs"
-        if any(
-            word in message
-            for word in (
-                "apr",
-                "fee",
-                "terms",
-                "doc stamp",
-                "registration fee",
-                "repayment schedule",
-            )
-        ):
-            return "terms"
-
-        if "auto equity" in message or "title loan" in message or "car equity" in message:
-            return "auto_equity_loan"
-        if "different" in message and "simple loans" in message:
-            return "what_makes_simple_loans_different"
-        if "credit" in message and ("run" in message or "check" in message or "report" in message):
-            return "credit_check"
-        if "job" in message or "employed" in message or "employment" in message:
-            return "job_requirement"
-        if "how long" in message or "30 minutes" in message or "process" in message:
-            return "process_time"
-        if any(word in message for word in ("zelle", "paypal", "moneygram", "ach", "wire", "debit card")):
-            return "funding_methods"
-        if "how much" in message or "$25,000" in message or "25000" in message or "max" in message:
-            return "max_loan_amount"
-        if "online" in message or "office" in message:
-            return "fully_online"
-
-        if any(keyword in message for keyword in STATUS_IDENTIFIER_KEYWORDS):
-            return "status"
-        return "unknown"
-
-    def _intent_response(self, intent: str) -> str:
-        if intent == "greeting":
-            return "How can I help you today?"
-
-        if intent == "status":
-            self.state.awaiting_status_identifier = True
-            self.state.awaiting_resolution_confirmation = False
-            return "I can help with your loan status. Please share your account identifier."
-
-        if intent == "disbursement_timeline":
-            return LOAN_STATUS_AND_DISBURSEMENT + " " + self._resolution_question()
-
-        if intent == "payments":
-            return PAYMENT_POLICY + " " + self._resolution_question()
-
-        if intent == "late_hardship":
-            return LATE_AND_HARDSHIP_POLICY + " " + self._resolution_question()
-
-        if intent == "vdc":
-            return VDC_POLICY + " " + self._resolution_question()
-
-        if intent == "vehicle_docs":
-            return VEHICLE_AND_TITLE_POLICY + " " + self._resolution_question()
-
-        if intent == "terms":
-            return LOAN_TERMS + " " + self._resolution_question()
-
-        if intent in FAQ_ANSWERS:
-            return FAQ_ANSWERS[intent] + " " + self._resolution_question()
-
-        return (
-            "I want to make sure I guide you correctly. Are you asking about loan "
-            "status, payments, documentation, terms, or VDC?"
+    def _is_status_request(self, normalized_message: str) -> bool:
+        status_phrases = (
+            "status",
+            "where is my loan",
+            "check my loan",
+            "my application",
+            "application status",
+            "pending",
+        )
+        return any(phrase in normalized_message for phrase in status_phrases) or any(
+            keyword in normalized_message for keyword in STATUS_IDENTIFIER_KEYWORDS
         )
 
     def _resolution_question(self) -> str:
         self.state.awaiting_resolution_confirmation = True
         return resolution_question(self._rng)
 
-    def _closing_message(self) -> str:
-        return closing_message(self._rng)
+    def _reset_pending_prompts(self) -> None:
+        self.state.awaiting_status_identifier = False
+        self.state.awaiting_resolution_confirmation = False
+        self.state.awaiting_followup_interest = False
+        self.state.awaiting_followup_channel = False
+        self.state.awaiting_followup_time = False
 
 
-def run_chat() -> None:
-    agent = SimpleLoansSupportAgent()
-    print("Simple Loans Support Chat")
-    print("Type 'exit' to quit.\n")
-    while True:
-        user_input = input("You: ").strip()
-        if user_input.lower() in {"exit", "quit"}:
-            print("Agent: Thanks for contacting Simple Loans support. Take care.")
-            break
-        if not user_input:
-            print("Agent: Please send a message when you are ready.")
-            continue
-        print(f"Agent: {agent.respond(user_input)}")
+class SimpleLoansVoiceAgent(Agent):
+    """LiveKit Agent that routes user turns through a deterministic policy engine."""
+
+    def __init__(self) -> None:
+        super().__init__(instructions=VOICE_SYSTEM_INSTRUCTIONS)
+        self._policy = SimpleLoansPolicyEngine()
+
+    async def llm_node(
+        self,
+        chat_ctx: llm.ChatContext,
+        tools: list[llm.Tool],
+        model_settings: ModelSettings,
+    ) -> AsyncIterable[str]:
+        del tools, model_settings
+        user_text = _latest_user_message(chat_ctx)
+        response = self._policy.answer(user_text)
+        return _single_response_stream(response)
 
 
-def _normalize(value: str) -> str:
-    return re.sub(r"\s+", " ", value.lower()).strip()
+def prewarm(proc: JobProcess) -> None:
+    """Load VAD and turn detector once per process for low cold-start latency."""
+    proc.userdata["vad"] = silero.VAD.load(
+        min_speech_duration=0.05,
+        min_silence_duration=0.45,
+        prefix_padding_duration=0.35,
+        activation_threshold=0.55,
+        sample_rate=16000,
+        force_cpu=True,
+    )
+    proc.userdata["turn_detector"] = MultilingualModel()
+
+
+async def entrypoint(ctx: JobContext) -> None:
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    await ctx.wait_for_participant()
+
+    session = AgentSession(
+        vad=ctx.proc.userdata["vad"],
+        turn_detection=ctx.proc.userdata["turn_detector"],
+        stt=deepgram.STT(
+            model=os.getenv("DEEPGRAM_MODEL", "nova-3"),
+            language="en-US",
+            endpointing_ms=25,
+            no_delay=True,
+            smart_format=True,
+            filler_words=False,
+        ),
+        tts=cartesia.TTS(
+            model=os.getenv("CARTESIA_MODEL", "sonic-3"),
+            voice=os.getenv("CARTESIA_VOICE_ID", "f786b574-daa5-4673-aa0c-cbe3e8534c02"),
+            language="en",
+            speed=1.05,
+            text_pacing=False,
+        ),
+        allow_interruptions=True,
+        min_endpointing_delay=0.25,
+        max_endpointing_delay=1.2,
+        preemptive_generation=True,
+    )
+
+    await session.start(agent=SimpleLoansVoiceAgent(), room=ctx.room)
+    await session.say(OPENING_DISCLOSURE, allow_interruptions=True)
+
+
+def _latest_user_message(chat_ctx: llm.ChatContext) -> str:
+    for message in reversed(chat_ctx.messages()):
+        if str(message.role) == "user":
+            return message.text_content
+    return ""
+
+
+async def _single_response_stream(text: str) -> AsyncIterable[str]:
+    yield text
 
 
 def _is_yes(normalized_value: str) -> bool:
@@ -314,18 +258,17 @@ def _starts_with_or_equals(normalized_value: str, candidates: set[str]) -> bool:
     return False
 
 
-def _has_greeting(normalized_value: str) -> bool:
-    return bool(re.search(r"\b(hello|hi|hey)\b", normalized_value))
-
-
 def _looks_like_identifier(value: str) -> bool:
     compact = value.strip()
-    return bool(
-        re.search(r"[a-zA-Z]", compact)
-        and re.search(r"\d", compact)
-        and len(compact) >= 5
-    )
+    return bool(re.search(r"[a-zA-Z]", compact) and re.search(r"\d", compact) and len(compact) >= 5)
 
 
 if __name__ == "__main__":
-    run_chat()
+    load_dotenv()
+    cli.run_app(
+        WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
+            agent_name="simple-loans-voice-support",
+        )
+    )
